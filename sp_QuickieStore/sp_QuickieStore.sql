@@ -419,8 +419,8 @@ BEGIN
     SELECT '        (blocking, resource contention, I/O). The multiplier shows how much worse duration is vs CPU.' UNION ALL
     SELECT '    param sensitive (1 plan, cpu Nx) - single plan but wildly varying CPU times across executions.' UNION ALL
     SELECT '        Classic parameter sniffing: one plan shape that works for some parameter values but not others.' UNION ALL
-    SELECT '    plan instability (N plans) - multiple plans compiled for variants of this query.' UNION ALL
-    SELECT '        The optimizer keeps choosing different strategies, which usually means inconsistent performance.' UNION ALL
+    SELECT '    plan instability (N plans) - multiple plans with fewer than 5 executions per plan, excluding RECOMPILE hints.' UNION ALL
+    SELECT '        The optimizer keeps recompiling frequently, which usually means inconsistent performance.' UNION ALL
     SELECT '    spills/spools (N MB/exec) - writes detected on a SELECT-like query (no INSERT/UPDATE/DELETE/MERGE).' UNION ALL
     SELECT '        This typically means tempdb spills from underestimated memory grants, or worktable spools.' UNION ALL
     SELECT REPLICATE('-', 100) UNION ALL
@@ -5250,6 +5250,8 @@ SELECT
                 N'' | '' +
                 CASE
                     WHEN s.plan_count > 1
+                     AND s.total_executions / s.plan_count < 5
+                     AND rt.query_sql_text NOT LIKE N''%RECOMPILE%''
                     THEN N''plan instability ('' +
                          CONVERT(nvarchar(10), s.plan_count) +
                          N'' plans)''
