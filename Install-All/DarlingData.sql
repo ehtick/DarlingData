@@ -1,4 +1,4 @@
--- Compile Date: 04/06/2026 03:09:14 UTC
+-- Compile Date: 04/06/2026 12:14:51 UTC
 SET ANSI_NULLS ON;
 SET ANSI_PADDING ON;
 SET ANSI_WARNINGS ON;
@@ -36898,7 +36898,8 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
         HAVING
             COUNT_BIG(DISTINCT qs.plan_handle) > 1
         ORDER BY
-            COUNT_BIG(DISTINCT qs.plan_handle) DESC
+            COUNT_BIG(DISTINCT qs.plan_handle) DESC,
+            SUM(qs.total_worker_time) DESC
         OPTION(RECOMPILE, MAXDOP 1);
 
         RETURN;
