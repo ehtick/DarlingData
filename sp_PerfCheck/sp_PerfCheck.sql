@@ -1142,8 +1142,14 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
     FROM sys.dm_os_sys_info AS osi;
     END;
 
-    /* Check if Lock Pages in Memory is enabled (on-prem and managed instances only) */
+    /* Check if Lock Pages in Memory is enabled.
+       Only on-prem can change LPIM. Azure Managed Instance and AWS RDS
+       both run SQL Server on platforms that don't expose the
+       LockPagesInMemory user right, so flagging them is unactionable
+       noise. Matches the IFI check gate below for consistency. */
     IF  @azure_sql_db = 0
+    AND @azure_managed_instance = 0
+    AND @aws_rds = 0
     AND @has_view_server_state = 1
     BEGIN
         INSERT INTO
