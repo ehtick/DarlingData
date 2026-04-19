@@ -3115,14 +3115,20 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
       AND ia1.exact_match_hash = ia2.exact_match_hash  /* Exact match: keys + includes + filter */
     WHERE ia1.consolidation_rule IS NULL  /* Not already processed */
     AND   ia2.consolidation_rule IS NULL  /* Not already processed */
-    /* Exclude unique constraints - we'll handle those separately in Rule 7 */
+    /* Exclude unique constraints and primary keys on the loser (ia1) side.
+       Rule 2 is only allowed to DISABLE a regular nonclustered index — never
+       a PK or UC, both of which back FK referential integrity and cannot be
+       safely disabled. UCs are still processed as Rule 7.5 targets; PKs are
+       off-limits entirely for disabling. The opposite permutation of this
+       pair (with the PK as ia2, the keeper) still runs and correctly
+       disables the non-PK duplicate. */
     AND NOT EXISTS
     (
         SELECT
             1/0
-        FROM #index_details AS id1_uc
-        WHERE id1_uc.index_hash = ia1.index_hash
-        AND   id1_uc.is_unique_constraint = 1
+        FROM #index_details AS id1_pk
+        WHERE id1_pk.index_hash = ia1.index_hash
+        AND   (id1_pk.is_unique_constraint = 1 OR id1_pk.is_primary_key = 1)
     )
     AND NOT EXISTS
     (
@@ -3397,14 +3403,17 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
       AND ISNULL(ia1.included_columns, '') <> ISNULL(ia2.included_columns, '')  /* Different includes */
     WHERE ia1.consolidation_rule IS NULL  /* Not already processed */
     AND   ia2.consolidation_rule IS NULL  /* Not already processed */
-    /* Exclude pairs where either one is a unique constraint (we'll handle those separately in Rule 7) */
+    /* Exclude unique constraints and primary keys on the loser (ia1) side.
+       Same reasoning as Rule 2: Rule 5 may only DISABLE a regular NC, not a
+       PK or UC whose index backs FK referential integrity. UCs are still
+       processed via Rule 7.5; PKs must never be disabled. */
     AND NOT EXISTS
     (
         SELECT
             1/0
-        FROM #index_details AS id1_uc
-        WHERE id1_uc.index_hash = ia1.index_hash
-        AND   id1_uc.is_unique_constraint = 1
+        FROM #index_details AS id1_pk
+        WHERE id1_pk.index_hash = ia1.index_hash
+        AND   (id1_pk.is_unique_constraint = 1 OR id1_pk.is_primary_key = 1)
     )
     AND NOT EXISTS
     (
