@@ -491,7 +491,13 @@ BEGIN
     (
         VALUES
            (
-                N'"' + @custom_message + '"',
+                /* xp_readerrorlog search strings are wrapped in double quotes
+                   (see the #search.command computed column), so any literal "
+                   inside the user-supplied @custom_message must be doubled to
+                   avoid closing the argument early and producing an
+                   "Incorrect syntax near '+'" error when sp_executesql parses
+                   the generated batch. */
+                N'"' + REPLACE(@custom_message, N'"', N'""') + N'"',
                 N'"' + CONVERT(nvarchar(10), DATEADD(DAY, @days_back, SYSDATETIME()), 112) + N'"',
                 N'"' + CONVERT(nvarchar(30), @start_date) + N'"',
                 N'"' + CONVERT(nvarchar(30), @end_date) + N'"'
