@@ -3707,6 +3707,21 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
       ON  ia_nc.scope_hash = ia_uc.scope_hash  /* Same database and object */
       AND ia_nc.index_name <> ia_uc.index_name /* Different index */
       AND ia_uc.key_columns = ia_nc.key_columns  /* Verify key columns EXACT match */
+    WHERE NOT EXISTS
+    (
+        /* Don't propose replacing a unique constraint that backs an inbound
+           foreign key. Dropping it would be blocked by SQL Server, and
+           ALTER INDEX ... DISABLE on its backing index silently disables
+           every FK referencing it (leaving orphan rows possible). The user's
+           cleanup script would either error mid-execution or break
+           referential integrity without warning. */
+        SELECT
+            1/0
+        FROM #index_details AS id_fk
+        WHERE id_fk.index_hash = ia_uc.index_hash
+        AND   id_fk.is_foreign_key_reference = 1
+        AND   id_fk.is_included_column = 0
+    )
     OPTION(RECOMPILE);
 
     /* Second, mark nonclustered indexes to be made unique */
