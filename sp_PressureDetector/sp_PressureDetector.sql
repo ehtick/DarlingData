@@ -2284,13 +2284,16 @@ OPTION(MAXDOP 1, RECOMPILE);',
                                     total_data_files =
                                         COUNT_BIG(*),
                                     min_size_gb =
-                                        MIN(mf.size * 8) / 1024 / 1024,
+                                        CONVERT(decimal(19, 2), MIN(mf.size * 8.0) / 1024.0 / 1024.0),
                                     max_size_gb =
-                                        MAX(mf.size * 8) / 1024 / 1024,
+                                        CONVERT(decimal(19, 2), MAX(mf.size * 8.0) / 1024.0 / 1024.0),
+                                    /* Exclude percent-growth files: their mf.growth is a percentage,
+                                       not page count, so * 8 math produces meaningless GB numbers.
+                                       Percent-growth files are legacy/misconfigured in tempdb anyway. */
                                     min_growth_increment_gb =
-                                        MIN(mf.growth * 8) / 1024 / 1024,
+                                        CONVERT(decimal(19, 2), MIN(CASE WHEN mf.is_percent_growth = 0 THEN mf.growth * 8.0 END) / 1024.0 / 1024.0),
                                     max_growth_increment_gb =
-                                        MAX(mf.growth * 8) / 1024 / 1024,
+                                        CONVERT(decimal(19, 2), MAX(CASE WHEN mf.is_percent_growth = 0 THEN mf.growth * 8.0 END) / 1024.0 / 1024.0),
                                     scheduler_total_count =
                                         (
                                             SELECT
@@ -2576,14 +2579,18 @@ OPTION(MAXDOP 1, RECOMPILE);',
                 @database_size_out = N'
                 SELECT
                     @database_size_out_gb =
-                        SUM
+                        CONVERT
                         (
-                            CONVERT
+                            decimal(19, 2),
+                            SUM
                             (
-                                bigint,
-                                df.size
-                            )
-                        ) * 8 / 1024 / 1024
+                                CONVERT
+                                (
+                                    bigint,
+                                    df.size
+                                )
+                            ) * 8.0 / 1024.0 / 1024.0
+                        )
                 FROM sys.database_files AS df
                 OPTION(MAXDOP 1, RECOMPILE);';
         END;
@@ -2593,14 +2600,18 @@ OPTION(MAXDOP 1, RECOMPILE);',
                 @database_size_out = N'
                 SELECT
                     @database_size_out_gb =
-                        SUM
+                        CONVERT
                         (
-                            CONVERT
+                            decimal(19, 2),
+                            SUM
                             (
-                                bigint,
-                                mf.size
-                            )
-                        ) * 8 / 1024 / 1024
+                                CONVERT
+                                (
+                                    bigint,
+                                    mf.size
+                                )
+                            ) * 8.0 / 1024.0 / 1024.0
+                        )
                 FROM sys.master_files AS mf
                 WHERE mf.database_id > 4
                 OPTION(MAXDOP 1, RECOMPILE);';
@@ -2654,9 +2665,9 @@ OPTION(MAXDOP 1, RECOMPILE);',
                 indicators_system =
                     t.record.value('(/Record/ResourceMonitor/IndicatorsSystem)[1]', 'integer'),
                 physical_memory_available_gb =
-                    t.record.value('(/Record/MemoryRecord/AvailablePhysicalMemory)[1]', 'bigint') / 1024 / 1024,
+                    CONVERT(decimal(19, 2), t.record.value('(/Record/MemoryRecord/AvailablePhysicalMemory)[1]', 'bigint') / 1024.0 / 1024.0),
                 virtual_memory_available_gb =
-                    t.record.value('(/Record/MemoryRecord/AvailableVirtualAddressSpace)[1]', 'bigint') / 1024 / 1024
+                    CONVERT(decimal(19, 2), t.record.value('(/Record/MemoryRecord/AvailableVirtualAddressSpace)[1]', 'bigint') / 1024.0 / 1024.0)
             FROM sys.dm_os_sys_info AS osi
             CROSS JOIN
             (
@@ -2944,12 +2955,12 @@ OPTION(MAXDOP 1, RECOMPILE);',
                     SELECT
                         CONVERT
                         (
-                            bigint,
-                            c.value_in_use
+                            decimal(19, 2),
+                            CONVERT(bigint, c.value_in_use) / 1024.0
                         )
                     FROM sys.configurations AS c
                     WHERE c.name = N''max server memory (MB)''
-                ) / 1024,
+                ),
             max_memory_grant_cap =
                 @memory_grant_cap,
             memory_model =
