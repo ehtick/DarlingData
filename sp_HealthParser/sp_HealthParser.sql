@@ -5728,9 +5728,16 @@ AND   ca.utc_timestamp < @end_date';
             FROM #deadlocks AS d
             CROSS APPLY d.xml_deadlock_report.nodes('//deadlock/process-list/process') AS e(x)
         ) AS x
+        /* Standard "filter if supplied, pass-through if NULL" predicate
+           pairs must be combined with AND between the groups — OR let
+           rows through whenever either parameter was NULL, which makes
+           the @database_name/@dbid filter loose whenever only one side
+           was supplied. Currently masked because the validation block
+           above aborts when the two disagree, but the shape was
+           wrong and would break if that validation ever relaxed. */
         WHERE (x.database_id = @dbid
                OR @dbid IS NULL)
-        OR    (x.current_database_name = @database_name
+        AND   (x.current_database_name = @database_name
                OR @database_name IS NULL)
         OPTION(RECOMPILE, MAXDOP 1);
 
