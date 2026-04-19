@@ -890,6 +890,25 @@ BEGIN
     RETURN;
 END;
 
+/*
+@seconds_sample drives the WAITFOR DELAY that controls how long the XE session
+samples before we shred results. When NULL it's treated as unset. When
+explicitly 0 the user is asking for no sampling, which would hit the
+unconditional WAITFOR below with an empty @waitfor string and raise a
+syntax error. Coerce NULL and 0 to 1 second — the minimum meaningful
+value — and warn if 0 was explicit.
+*/
+IF @debug = 1 BEGIN RAISERROR(N'Checking seconds_sample parameter', 0, 1) WITH NOWAIT; END;
+IF @seconds_sample IS NULL
+BEGIN
+    SET @seconds_sample = 1;
+END;
+ELSE IF @seconds_sample = 0
+BEGIN
+    RAISERROR(N'@seconds_sample = 0 is not meaningful (nothing would be sampled). Using 1 second instead. Pass a larger value for real sampling.', 0, 1) WITH NOWAIT;
+    SET @seconds_sample = 1;
+END;
+
 
 IF @debug = 1 BEGIN RAISERROR(N'Checking query sort order', 0, 1) WITH NOWAIT; END;
 IF @query_sort_order NOT IN
