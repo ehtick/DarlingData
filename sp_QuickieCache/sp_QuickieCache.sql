@@ -1083,8 +1083,14 @@ CROSS APPLY
     FROM sys.dm_exec_plan_attributes(qs.plan_handle) AS pa
     WHERE pa.attribute = N''dbid''
 ) AS pa
-WHERE qs.query_hash <> 0x0000000000000000
-AND   qs.execution_count >= @minimum_execution_count' +
+WHERE qs.query_hash <> 0x0000000000000000' +
+    /* @minimum_execution_count is enforced ONLY in the HAVING
+       SUM(execution_count) below — applying it per-row here
+       filtered out individual plans whose single-plan execution_count
+       was below the floor but whose group total was above it
+       (think: a recompile-heavy query with many plans each run a
+       few times that add up to a lot). Same reasoning applies to
+       the procedure / function / trigger paths further down. */
     CASE
         WHEN @ignore_system_databases = 1
         THEN N'
@@ -1271,8 +1277,9 @@ OPTION(RECOMPILE, MAXDOP 1);';
                         ps.execution_count DESC
                 )
         FROM sys.dm_exec_procedure_stats AS ps
-        WHERE ps.execution_count >= @minimum_execution_count
-        AND   ps.database_id > CASE WHEN @ignore_system_databases = 1 THEN 4 ELSE 0 END
+        /* See Statement path comment re: why @minimum_execution_count
+           is HAVING-only rather than a per-row pre-filter. */
+        WHERE ps.database_id > CASE WHEN @ignore_system_databases = 1 THEN 4 ELSE 0 END
         AND   ps.database_id < 32761
         AND   ps.database_id = ISNULL(@database_id, ps.database_id)
         AND   ps.cached_time >= ISNULL(@start_date, ps.cached_time)
@@ -1380,8 +1387,9 @@ FROM
                     fs.execution_count DESC
             )
     FROM sys.dm_exec_function_stats AS fs
-    WHERE fs.execution_count >= @minimum_execution_count
-    AND   fs.database_id > CASE WHEN @ignore_system_databases = 1 THEN 4 ELSE 0 END
+    /* See Statement path comment re: why @minimum_execution_count
+       is HAVING-only rather than a per-row pre-filter. */
+    WHERE fs.database_id > CASE WHEN @ignore_system_databases = 1 THEN 4 ELSE 0 END
     AND   fs.database_id < 32761
     AND   fs.database_id = ISNULL(@database_id, fs.database_id)
     AND   fs.cached_time >= ISNULL(@start_date, fs.cached_time)
@@ -1486,8 +1494,9 @@ OPTION(RECOMPILE, MAXDOP 1);';
                         ts.execution_count DESC
                 )
         FROM sys.dm_exec_trigger_stats AS ts
-        WHERE ts.execution_count >= @minimum_execution_count
-        AND   ts.database_id > CASE WHEN @ignore_system_databases = 1 THEN 4 ELSE 0 END
+        /* See Statement path comment re: why @minimum_execution_count
+           is HAVING-only rather than a per-row pre-filter. */
+        WHERE ts.database_id > CASE WHEN @ignore_system_databases = 1 THEN 4 ELSE 0 END
         AND   ts.database_id < 32761
         AND   ts.database_id = ISNULL(@database_id, ts.database_id)
         AND   ts.cached_time >= ISNULL(@start_date, ts.cached_time)
