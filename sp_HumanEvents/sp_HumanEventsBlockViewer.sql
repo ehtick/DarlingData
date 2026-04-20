@@ -775,8 +775,8 @@ BEGIN
                 collection_time datetime2(7) NOT NULL DEFAULT SYSDATETIME(),
                 blocked_process_report varchar(22) NOT NULL,
                 event_time datetime2(7) NULL,
-                database_name nvarchar(128) NULL,
-                currentdbname nvarchar(256) NULL,
+                database_name sysname NULL,
+                currentdbname sysname NULL,
                 contentious_object nvarchar(4000) NULL,
                 activity varchar(8) NULL,
                 blocking_tree varchar(8000) NULL,
@@ -873,7 +873,7 @@ CREATE TABLE
 (
     id integer IDENTITY PRIMARY KEY CLUSTERED,
     check_id integer NOT NULL,
-    database_name nvarchar(256) NULL,
+    database_name sysname NULL,
     object_name nvarchar(1000) NULL,
     finding_group nvarchar(100) NULL,
     finding nvarchar(4000) NULL,
@@ -1312,7 +1312,7 @@ BEGIN
 
     SELECT
         bx.event_time,
-        currentdbname = bd.value('(process/@currentdbname)[1]', 'nvarchar(128)'),
+        currentdbname = bd.value('(process/@currentdbname)[1]', 'sysname'),
         spid = bd.value('(process/@spid)[1]', 'integer'),
         ecid = bd.value('(process/@ecid)[1]', 'integer'),
         query_text_pre = bd.value('(process/inputbuf/text())[1]', 'nvarchar(max)'),
@@ -1369,7 +1369,7 @@ BEGIN
     /*Blocking queries*/
     SELECT
         bx.event_time,
-        currentdbname = bg.value('(process/@currentdbname)[1]', 'nvarchar(128)'),
+        currentdbname = bg.value('(process/@currentdbname)[1]', 'sysname'),
         spid = bg.value('(process/@spid)[1]', 'integer'),
         ecid = bg.value('(process/@ecid)[1]', 'integer'),
         query_text_pre = bg.value('(process/inputbuf/text())[1]', 'nvarchar(max)'),
@@ -1951,7 +1951,7 @@ SELECT
     log_used = bd.value('(process/@logused)[1]', 'bigint'),
     clientoption1 = bd.value('(process/@clientoption1)[1]', 'bigint'),
     clientoption2 = bd.value('(process/@clientoption2)[1]', 'bigint'),
-    currentdbname = bd.value('(process/@currentdbname)[1]', 'nvarchar(256)'),
+    currentdbname = bd.value('(process/@currentdbname)[1]', 'sysname'),
     currentdbid = bd.value('(process/@currentdb)[1]', 'integer'),
     blocking_level = 0,
     sort_order = CONVERT(varchar(400), ''),
@@ -2071,7 +2071,7 @@ SELECT
     log_used = bg.value('(process/@logused)[1]', 'bigint'),
     clientoption1 = bg.value('(process/@clientoption1)[1]', 'bigint'),
     clientoption2 = bg.value('(process/@clientoption2)[1]', 'bigint'),
-    currentdbname = bg.value('(process/@currentdbname)[1]', 'nvarchar(128)'),
+    currentdbname = bg.value('(process/@currentdbname)[1]', 'sysname'),
     currentdbid = bg.value('(process/@currentdb)[1]', 'integer'),
     blocking_level = 0,
     sort_order = CONVERT(varchar(400), ''),
