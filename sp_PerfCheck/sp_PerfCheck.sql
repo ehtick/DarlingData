@@ -3517,7 +3517,7 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
             VALUES
             (
                 1002,
-                40, /* High priority */
+                20, /* High priority — OS-starvation risk */
                 N'Server Configuration',
                 N'Max Server Memory Too Close To Physical Memory',
                 N'Max server memory (' +
