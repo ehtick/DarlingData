@@ -1028,6 +1028,11 @@ OPTION(MAXDOP 1, RECOMPILE);',
         hours_wait_time decimal(38,2),
         avg_ms_per_wait decimal(38,2),
         percent_signal_waits decimal(38,2),
+        /* Raw ms values so the sample-mode JOIN can compute
+           window-local percent_signal_waits as a proper delta ratio
+           rather than averaging the two cumulative snapshot ratios. */
+        signal_wait_time_ms bigint,
+        wait_time_ms bigint,
         waiting_tasks_count_n bigint,
         sample_time datetime,
         sorting bigint,
@@ -1173,6 +1178,8 @@ OPTION(MAXDOP 1, RECOMPILE);',
             hours_wait_time,
             avg_ms_per_wait,
             percent_signal_waits,
+            signal_wait_time_ms,
+            wait_time_ms,
             waiting_tasks_count_n,
             sample_time,
             sorting
@@ -1325,6 +1332,8 @@ OPTION(MAXDOP 1, RECOMPILE);',
                         0.
                     )
                 ),
+            dows.signal_wait_time_ms,
+            dows.wait_time_ms,
             dows.waiting_tasks_count,
             sample_time =
                 SYSDATETIME(),
@@ -1469,11 +1478,37 @@ OPTION(MAXDOP 1, RECOMPILE);',
                                 0.
                             )
                         ),
+                    /*
+                    Window-local percent_signal_waits = 100 * signal_delta / total_delta.
+                    Previously this averaged the two snapshots' CUMULATIVE
+                    percentages, which for a long-running server
+                    approximates the lifetime signal-wait percentage —
+                    not what the user asked for by setting @sample_seconds.
+                    Stored raw *_wait_time_ms columns on @waits so we can
+                    compute the correct ratio on the delta window.
+
+                    Deliberately NOT clamped to 100. sys.dm_os_wait_stats
+                    can briefly report signal_wait > wait in short sample
+                    windows due to counter update timing, so the raw value
+                    can exceed 100%. Showing the raw value lets the operator
+                    see that their window is too short / noisy for this
+                    metric to be meaningful; hiding it behind a cap would
+                    make a DMV jitter read like a confident 100%.
+                    */
                     percent_signal_waits =
                         CONVERT
                         (
                             decimal(38,1),
-                            (w2.percent_signal_waits + w.percent_signal_waits) / 2
+                            ISNULL
+                            (
+                                100.0 * (w2.signal_wait_time_ms - w.signal_wait_time_ms) /
+                                    NULLIF
+                                    (
+                                        1.0 * (w2.wait_time_ms - w.wait_time_ms),
+                                        0.
+                                    ),
+                                0.
+                            )
                         ),
                     waiting_tasks_count =
                         FORMAT((w2.waiting_tasks_count_n - w.waiting_tasks_count_n), 'N0'),
