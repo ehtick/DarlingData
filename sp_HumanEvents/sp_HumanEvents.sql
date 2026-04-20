@@ -4212,7 +4212,11 @@ END
         plan_handle = c.value(''xs:hexBinary((action[@name="plan_handle"]/value/text())[1])'', ''varbinary(64)'')
 FROM #human_events_xml_internal AS xet
 OUTER APPLY xet.human_events_xml.nodes(''//event'') AS oa(c)
-WHERE c.exist(''(data[@name="duration"]/value/text()[. > 0])'') = 1
+/* Match the live parser''s @gimme_danger semantic — without it, the
+   table-logging path silently dropped zero-duration waits even when
+   the user explicitly opted into capturing them via @gimme_danger = 1. */
+WHERE (c.exist(''(data[@name="duration"]/value/text()[. > 0])'') = 1
+    OR @gimme_danger = 1)
 AND   c.exist(''@timestamp[. > sql:variable("@date_filter")]'') = 1;')
                              )
                         WHEN @event_type_check LIKE N'%lock%' /*Blocking!*/
@@ -4727,8 +4731,9 @@ ORDER BY
             /* this executes the insert */
             EXECUTE sys.sp_executesql
                 @table_sql,
-              N'@date_filter datetime2(7)',
-                @date_filter;
+              N'@date_filter datetime2(7), @gimme_danger bit',
+                @date_filter,
+                @gimme_danger;
 
             /*Update the worker table's last checked, and conditionally, updated dates*/
             UPDATE
