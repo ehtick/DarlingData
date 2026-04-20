@@ -2060,7 +2060,19 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
     /* Check for stolen memory from buffer pool */
     IF @has_view_server_state = 1
     BEGIN
-        /* Calculate pagelatch wait time for TempDB contention check */
+        /* Calculate pagelatch wait time for TempDB contention check.
+           Split into two scalar SELECTs — the previous version mixed an
+           aggregated value (@pagelatch_wait_hours) with a non-aggregated
+           one (@server_uptime_hours) in the same SELECT by joining
+           wait_stats to sys_info and GROUP BY'ing on the uptime
+           expression. It worked only because sys_info is always a
+           single-row view, and the GROUP BY on a scalar expression
+           reads oddly. */
+        SELECT
+            @server_uptime_hours =
+                DATEDIFF(SECOND, osi.sqlserver_start_time, SYSDATETIME()) / 3600.0
+        FROM sys.dm_os_sys_info AS osi;
+
         SELECT
             @pagelatch_wait_hours =
                 SUM
@@ -2070,13 +2082,8 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
                         THEN osw.wait_time_ms / 1000.0 / 3600.0
                         ELSE 0
                     END
-                ),
-            @server_uptime_hours =
-                DATEDIFF(SECOND, osi.sqlserver_start_time, SYSDATETIME()) / 3600.0
-        FROM sys.dm_os_wait_stats AS osw
-        CROSS JOIN sys.dm_os_sys_info AS osi
-        GROUP BY
-            DATEDIFF(SECOND, osi.sqlserver_start_time, SYSDATETIME()) / 3600.0;
+                )
+        FROM sys.dm_os_wait_stats AS osw;
 
         SET @pagelatch_ratio_to_uptime =
             @pagelatch_wait_hours / NULLIF(@server_uptime_hours, 0) * 100;
