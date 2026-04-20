@@ -72,7 +72,7 @@ ALTER PROCEDURE
     @target_schema sysname = NULL, /*schema of the table*/
     @target_table sysname = NULL, /*table name*/
     @target_column sysname = NULL, /*column containing XML data*/
-    @timestamp_column sysname = NULL, /*column containing timestamp (optional)*/
+    @timestamp_column sysname = NULL, /*column containing UTC timestamp (optional); see @help = 1 for details*/
     @log_to_table bit = 0, /*enable logging to permanent tables*/
     @log_database_name sysname = NULL, /*database to store logging tables*/
     @log_schema_name sysname = NULL, /*schema to store logging tables*/
@@ -126,7 +126,7 @@ BEGIN
                  WHEN N'@target_schema' THEN 'schema of the table containing blocked process report data'
                  WHEN N'@target_table' THEN 'table containing blocked process report data'
                  WHEN N'@target_column' THEN 'column containing blocked process report XML'
-                 WHEN N'@timestamp_column' THEN 'column containing timestamp for filtering (optional)'
+                 WHEN N'@timestamp_column' THEN 'column containing UTC timestamp for filtering (optional). MUST be stored in UTC — @start_date and @end_date are shifted to UTC internally to match the XML @timestamp attribute, and the same UTC-shifted values are used for this column filter. A column in local time will be filtered against the wrong window.'
                  WHEN N'@log_to_table' THEN N'enable logging to permanent tables instead of returning results'
                  WHEN N'@log_database_name' THEN N'database to store logging tables'
                  WHEN N'@log_schema_name' THEN N'schema to store logging tables'
@@ -150,7 +150,7 @@ BEGIN
                  WHEN N'@target_schema' THEN 'a schema in the target database'
                  WHEN N'@target_table' THEN 'a table in the target schema'
                  WHEN N'@target_column' THEN 'an XML column containing blocked process report data'
-                 WHEN N'@timestamp_column' THEN 'a datetime column for filtering by date range'
+                 WHEN N'@timestamp_column' THEN 'a datetime / datetime2 / datetimeoffset column storing UTC timestamps'
                  WHEN N'@log_to_table' THEN N'0 or 1'
                  WHEN N'@log_database_name' THEN N'any valid database name'
                  WHEN N'@log_schema_name' THEN N'any valid schema name'
@@ -1852,7 +1852,16 @@ BEGIN
     N'.nodes(''/event'') AS e(x)
     WHERE e.x.exist(''@name[ .= "blocked_process_report"]'') = 1';
 
-    /* Add timestamp filtering if specified*/
+    /*
+    Add timestamp filtering if specified.
+
+    NOTE: @start_date and @end_date are shifted from local to UTC earlier
+    in the proc so they line up with the XML @timestamp attribute (which
+    is UTC). The @timestamp_column value is passed through as-is, so the
+    caller's column MUST already contain UTC timestamps — if it holds
+    local time, rows will be filtered against the wrong window by the
+    local-vs-UTC offset. See the parameter help text.
+    */
     IF @timestamp_column IS NOT NULL
     BEGIN
             SET @extract_sql = @extract_sql + N'
