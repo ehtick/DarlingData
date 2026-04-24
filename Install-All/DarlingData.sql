@@ -1,4 +1,4 @@
--- Compile Date: 04/20/2026 21:53:32 UTC
+-- Compile Date: 04/24/2026 18:36:07 UTC
 SET ANSI_NULLS ON;
 SET ANSI_PADDING ON;
 SET ANSI_WARNINGS ON;
@@ -14877,46 +14877,146 @@ BEGIN
         RAISERROR('Inserting #block_findings, check_id 9', 0, 1) WITH NOWAIT;
     END;
 
+    /*
+    Build a session-to-lead-blocker map per monitor_loop.
+    A "lead blocker" is a session at the top of a blocking chain that
+    isn't itself being blocked by anyone else in that monitor_loop.
+    Every other (session_desc) in the chain is mapped to that lead so
+    their victim wait time cascades up to the true root cause rather
+    than being misattributed to an intermediate blocker that was just
+    stuck behind someone.
+    */
+    CREATE TABLE
+        #session_leads
+    (
+        monitor_loop integer NOT NULL,
+        lead_desc varchar(22) NOT NULL,
+        session_desc varchar(22) NOT NULL
+    );
+
+    CREATE CLUSTERED INDEX
+        cx_session_leads
+    ON #session_leads
+        (monitor_loop, session_desc);
+
     WITH
-        blocker_waits AS
+        walk
+    AS
+    (
+        /*
+        Anchor: a lead blocker never appears as a blocked_desc in the
+        same monitor_loop (nobody is blocking them).
+        */
+        SELECT
+            monitor_loop =
+                b.monitor_loop,
+            lead_desc =
+                b.blocking_desc,
+            session_desc =
+                b.blocking_desc,
+            lead_path =
+                CONVERT(varchar(400), b.blocking_desc)
+        FROM #blocking AS b
+        WHERE NOT EXISTS
+        (
+            SELECT
+                1/0
+            FROM #blocking AS b2
+            WHERE b2.monitor_loop = b.monitor_loop
+            AND   b2.blocked_desc = b.blocking_desc
+        )
+
+        UNION ALL
+
+        /*
+        Recursive step: whoever the current session blocks inherits
+        the same lead. Cycle guard mirrors the existing hierarchy CTE
+        pattern (line ~2219) — skip a blocked_desc already on this path.
+        */
+        SELECT
+            w.monitor_loop,
+            w.lead_desc,
+            next_hop.blocked_desc,
+            CONVERT
+            (
+                varchar(400),
+                w.lead_path + ' ' + next_hop.blocked_desc
+            )
+        FROM walk AS w
+        JOIN #blocking AS next_hop
+          ON  next_hop.monitor_loop = w.monitor_loop
+          AND next_hop.blocking_desc = w.session_desc
+        WHERE w.lead_path NOT LIKE '%' + next_hop.blocked_desc + '%'
+    )
+    INSERT
+        #session_leads WITH (TABLOCK)
+    (
+        monitor_loop,
+        lead_desc,
+        session_desc
+    )
+    SELECT DISTINCT
+        w.monitor_loop,
+        w.lead_desc,
+        w.session_desc
+    FROM walk AS w
+    OPTION(RECOMPILE, MAXRECURSION 100);
+
+    /*
+    Cycle fallback: if every session in a monitor_loop is blocked by
+    someone else (true cycle, pre-deadlock-detection), the anchor
+    produces no rows and those blocking_descs don't land in the map.
+    Treat any unmapped blocking_desc as its own lead so their waits
+    aren't dropped from the rollup.
+    */
+    INSERT
+        #session_leads WITH (TABLOCK)
+    (
+        monitor_loop,
+        lead_desc,
+        session_desc
+    )
+    SELECT DISTINCT
+        b.monitor_loop,
+        b.blocking_desc,
+        b.blocking_desc
+    FROM #blocking AS b
+    WHERE NOT EXISTS
     (
         SELECT
+            1/0
+        FROM #session_leads AS sl
+        WHERE sl.monitor_loop = b.monitor_loop
+        AND   sl.session_desc = b.blocking_desc
+    )
+    OPTION(RECOMPILE);
+
+    IF @debug = 1
+    BEGIN
+        SELECT
+            '#session_leads' AS table_name,
+            sl.*
+        FROM #session_leads AS sl
+        OPTION(RECOMPILE);
+    END;
+
+    WITH
+        bpr_with_lead AS
+    (
+        /*
+        Each BPR's victim wait, attributed to the blocker's chain lead.
+        The @database_name and @object_name filters apply to the BPR
+        (where the blocking actually happened); the chain walk itself
+        was done against the full monitor_loop so we can correctly
+        trace waits that cascade across objects.
+        */
+        SELECT
+            sl.lead_desc,
+            b.monitor_loop,
             b.database_name,
-            query_text_pre =
-                b.query_text_pre,
+            b.blocked_desc,
             b.transaction_id,
-            sql_handle =
-                CONVERT
-                (
-                    varbinary(64),
-                    b.blocked_process_report.value
-                    (
-                        '(/event/data/value/blocked-process-report/blocking-process/process/executionStack/frame[not(@sqlhandle = "0x0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000")]/@sqlhandle)[1]',
-                        'varchar(130)'
-                    ),
-                    1
-                ),
-            stmtstart =
-                ISNULL
-                (
-                    b.blocked_process_report.value
-                    (
-                        '(/event/data/value/blocked-process-report/blocking-process/process/executionStack/frame[not(@sqlhandle = "0x0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000")]/@stmtstart)[1]',
-                        'integer'
-                    ),
-                    0
-                ),
-            stmtend =
-                ISNULL
-                (
-                    b.blocked_process_report.value
-                    (
-                        '(/event/data/value/blocked-process-report/blocking-process/process/executionStack/frame[not(@sqlhandle = "0x0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000")]/@stmtend)[1]',
-                        'integer'
-                    ),
-                    -1
-                ),
-            wait_time_ms =
+            victim_wait_time_ms =
                 ISNULL
                 (
                     b.blocked_process_report.value
@@ -14926,33 +15026,128 @@ BEGIN
                     ),
                     0
                 )
-        FROM #blocks AS b
-        WHERE b.activity = 'blocking'
-        AND   (b.database_name = @database_name
-               OR @database_name IS NULL)
-        AND   (b.contentious_object = @object_name
-               OR @object_name IS NULL)
+        FROM #blocking AS b
+        JOIN #session_leads AS sl
+          ON  sl.monitor_loop = b.monitor_loop
+          AND sl.session_desc = b.blocking_desc
+        CROSS APPLY
+        (
+            SELECT
+                contentious_object =
+                    ISNULL
+                    (
+                        OBJECT_SCHEMA_NAME(b.object_id, b.database_id) +
+                        N'.' +
+                        OBJECT_NAME(b.object_id, b.database_id),
+                        N''
+                    )
+        ) AS co
+        WHERE
+        (
+            b.database_name = @database_name
+         OR @database_name IS NULL
+        )
+        AND
+        (
+            co.contentious_object = @object_name
+         OR @object_name IS NULL
+        )
     ),
-        blocker_per_victim AS
+        lead_sql AS
     (
+        /*
+        Representative sql_handle / stmtstart / stmtend for each
+        (monitor_loop, lead_desc). Pulled from any #blocking row where
+        the lead appears as the blocking-process. MAX is deterministic
+        across repeat BPR fires within the same monitor_loop.
+        */
         SELECT
-            bw.database_name,
-            bw.sql_handle,
-            bw.stmtstart,
-            bw.stmtend,
-            bw.query_text_pre,
-            bw.transaction_id,
-            wait_time_ms =
-                MAX(bw.wait_time_ms)
-        FROM blocker_waits AS bw
-        WHERE bw.sql_handle IS NOT NULL
+            b.monitor_loop,
+            lead_desc =
+                b.blocking_desc,
+            sql_handle =
+                CONVERT
+                (
+                    varbinary(64),
+                    MAX
+                    (
+                        b.blocked_process_report.value
+                        (
+                            '(/event/data/value/blocked-process-report/blocking-process/process/executionStack/frame[not(@sqlhandle = "0x0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000")]/@sqlhandle)[1]',
+                            'varchar(130)'
+                        )
+                    ),
+                    1
+                ),
+            stmtstart =
+                ISNULL
+                (
+                    MAX
+                    (
+                        b.blocked_process_report.value
+                        (
+                            '(/event/data/value/blocked-process-report/blocking-process/process/executionStack/frame[not(@sqlhandle = "0x0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000")]/@stmtstart)[1]',
+                            'integer'
+                        )
+                    ),
+                    0
+                ),
+            stmtend =
+                ISNULL
+                (
+                    MAX
+                    (
+                        b.blocked_process_report.value
+                        (
+                            '(/event/data/value/blocked-process-report/blocking-process/process/executionStack/frame[not(@sqlhandle = "0x0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000")]/@stmtend)[1]',
+                            'integer'
+                        )
+                    ),
+                    -1
+                ),
+            query_text_pre =
+                MAX(b.query_text_pre)
+        FROM #blocking AS b
+        WHERE EXISTS
+        (
+            SELECT
+                1/0
+            FROM #session_leads AS sl
+            WHERE sl.monitor_loop = b.monitor_loop
+            AND   sl.lead_desc = b.blocking_desc
+        )
         GROUP BY
-            bw.database_name,
-            bw.sql_handle,
-            bw.stmtstart,
-            bw.stmtend,
-            bw.query_text_pre,
-            bw.transaction_id
+            b.monitor_loop,
+            b.blocking_desc
+    ),
+        per_victim AS
+    (
+        /*
+        Dedup: one row per (lead_query_identity, victim_tx) with peak
+        wait, matching the existing pattern (MAX across monitor_loops
+        for the same victim rather than summing repeat BPR fires).
+        */
+        SELECT
+            bl.database_name,
+            ls.sql_handle,
+            ls.stmtstart,
+            ls.stmtend,
+            bl.transaction_id,
+            wait_time_ms =
+                MAX(bl.victim_wait_time_ms),
+            query_text_pre =
+                MAX(ls.query_text_pre)
+        FROM bpr_with_lead AS bl
+        JOIN lead_sql AS ls
+          ON  ls.monitor_loop = bl.monitor_loop
+          AND ls.lead_desc = bl.lead_desc
+        WHERE ls.sql_handle IS NOT NULL
+        GROUP BY
+            bl.database_name,
+            ls.sql_handle,
+            ls.stmtstart,
+            ls.stmtend,
+            bl.transaction_id
     )
     INSERT
         #block_findings
@@ -14967,7 +15162,7 @@ BEGIN
     SELECT
         check_id =
             9,
-        bpv.database_name,
+        pv.database_name,
         object_name =
             LEFT
             (
@@ -14977,7 +15172,7 @@ BEGIN
                     (
                         ISNULL
                         (
-                            MAX(bpv.query_text_pre),
+                            MAX(pv.query_text_pre),
                             N'[Unknown]'
                         ),
                         NCHAR(13),
@@ -14989,9 +15184,9 @@ BEGIN
                 200
             ),
         finding_group =
-            N'Top Blocking Query',
+            N'Top Lead Blocker',
         finding =
-            N'This query caused ' +
+            N'This lead blocker accounted for ' +
             CONVERT
             (
                 nvarchar(30),
@@ -15001,7 +15196,7 @@ BEGIN
                         CONVERT
                         (
                             bigint,
-                            bpv.wait_time_ms
+                            pv.wait_time_ms
                         )
                     ) / 1000 / 86400
                 )
@@ -15019,7 +15214,7 @@ BEGIN
                             CONVERT
                             (
                                 bigint,
-                                bpv.wait_time_ms
+                                pv.wait_time_ms
                             )
                         ) / 1000 % 86400
                     ),
@@ -15042,7 +15237,7 @@ BEGIN
                             CONVERT
                             (
                                 bigint,
-                                bpv.wait_time_ms
+                                pv.wait_time_ms
                             )
                         ) /
                         NULLIF
@@ -15054,7 +15249,7 @@ BEGIN
                                     CONVERT
                                     (
                                         bigint,
-                                        bpv.wait_time_ms
+                                        pv.wait_time_ms
                                     )
                                 )
                             ) OVER (),
@@ -15068,9 +15263,9 @@ BEGIN
             CONVERT
             (
                 nvarchar(20),
-                COUNT_BIG(DISTINCT bpv.transaction_id)
+                COUNT_BIG(DISTINCT pv.transaction_id)
             ) +
-            N' blocked sessions.',
+            N' blocked sessions in its chain.',
        sort_order =
            ROW_NUMBER() OVER
            (
@@ -15080,22 +15275,22 @@ BEGIN
                        CONVERT
                        (
                            bigint,
-                           bpv.wait_time_ms
+                           pv.wait_time_ms
                        )
                    ) DESC
            )
-    FROM blocker_per_victim AS bpv
+    FROM per_victim AS pv
     GROUP BY
-        bpv.database_name,
-        bpv.sql_handle,
-        bpv.stmtstart,
-        bpv.stmtend
+        pv.database_name,
+        pv.sql_handle,
+        pv.stmtstart,
+        pv.stmtend
     HAVING
-        SUM(CONVERT(bigint, bpv.wait_time_ms)) * 10 >=
+        SUM(CONVERT(bigint, pv.wait_time_ms)) * 10 >=
         (
             SELECT
-                SUM(CONVERT(bigint, bpv2.wait_time_ms))
-            FROM blocker_per_victim AS bpv2
+                SUM(CONVERT(bigint, pv2.wait_time_ms))
+            FROM per_victim AS pv2
         )
     OPTION(RECOMPILE);
 
@@ -38938,6 +39133,9 @@ OPTION(RECOMPILE, MAXDOP 1);';
         high_signals nvarchar(500) NULL,
         diagnostics nvarchar(max) NULL,
 
+        /* resource rollup */
+        resource_metrics xml NULL,
+
         /* plan metadata */
         oldest_plan_creation datetime NULL,
         newest_plan_creation datetime NULL,
@@ -38994,6 +39192,7 @@ OPTION(RECOMPILE, MAXDOP 1);';
         grant_pctl,
         spills_pctl,
         executions_pctl,
+        resource_metrics,
         oldest_plan_creation,
         newest_plan_creation,
         last_execution_time,
@@ -39156,6 +39355,44 @@ OPTION(RECOMPILE, MAXDOP 1);';
                      )
                 ELSE NULL
             END,
+
+        resource_metrics =
+        (
+            SELECT
+                [cpu/@total_ms]              = qs.total_cpu_ms,
+                [cpu/@avg_ms]                = qs.total_cpu_ms / NULLIF(qs.total_executions, 0),
+                [cpu/@min_ms]                = qs.min_cpu_ms,
+                [cpu/@max_ms]                = qs.max_cpu_ms,
+                [duration/@total_ms]         = qs.total_duration_ms,
+                [duration/@avg_ms]           = qs.total_duration_ms / NULLIF(qs.total_executions, 0),
+                [duration/@min_ms]           = qs.min_duration_ms,
+                [duration/@max_ms]           = qs.max_duration_ms,
+                [physical_reads/@total]      = qs.total_physical_reads,
+                [physical_reads/@avg]        = CONVERT(decimal(38, 2), qs.total_physical_reads) / NULLIF(qs.total_executions, 0),
+                [physical_reads/@min]        = qs.min_physical_reads,
+                [physical_reads/@max]        = qs.max_physical_reads,
+                [logical_writes/@total]      = qs.total_logical_writes,
+                [logical_writes/@avg]        = CONVERT(decimal(38, 2), qs.total_logical_writes) / NULLIF(qs.total_executions, 0),
+                [rows/@total]                = qs.total_rows,
+                [rows/@avg]                  = CONVERT(decimal(38, 2), qs.total_rows) / NULLIF(qs.total_executions, 0),
+                [rows/@min]                  = qs.min_rows,
+                [rows/@max]                  = qs.max_rows,
+                [grant/@total_mb]            = qs.total_grant_mb,
+                [grant/@avg_mb]              = qs.total_grant_mb / NULLIF(qs.total_executions, 0),
+                [grant/@max_mb]              = qs.max_grant_mb,
+                [used_grant/@total_mb]       = qs.total_used_grant_mb,
+                [used_grant/@avg_mb]         = qs.total_used_grant_mb / NULLIF(qs.total_executions, 0),
+                [used_grant/@max_mb]         = qs.max_used_grant_mb,
+                [spills/@total]              = qs.total_spills,
+                [spills/@avg]                = CONVERT(decimal(38, 2), qs.total_spills) / NULLIF(qs.total_executions, 0),
+                [spills/@max]                = qs.max_spills,
+                [executions/@total]          = qs.total_executions,
+                [parallelism/@max_dop]       = qs.max_dop
+            FOR
+                XML
+                PATH(N'metrics'),
+                TYPE
+        ),
 
         oldest_plan_creation = qs.oldest_plan_creation,
         newest_plan_creation = qs.newest_plan_creation,
@@ -39540,18 +39777,7 @@ OPTION(RECOMPILE, MAXDOP 1);';
         s.spills_share,
         s.executions_share,
         s.diagnostics,
-        s.total_cpu_ms,
-        s.total_duration_ms,
-        s.total_physical_reads,
-        s.total_logical_writes,
-        s.total_grant_mb,
-        s.total_spills,
-        s.max_grant_mb,
-        s.max_used_grant_mb,
-        s.max_spills,
-        s.max_dop,
-        s.min_rows,
-        s.max_rows,
+        s.resource_metrics,
         s.oldest_plan_creation,
         s.last_execution_time,
         s.sample_sql_handle,
@@ -39702,6 +39928,7 @@ ALTER PROCEDURE
     @include_query_hash_totals bit = 0, /*will add an additional column to final output with total resource usage by query hash, may be skewed by query_hash and query_plan_hash bugs with forced plans/plan guides*/
     @include_maintenance bit = 0, /*Set this bit to 1 to add maintenance operations such as index creation to the result set*/
     @find_high_impact bit = 0, /*finds the vital few queries consuming disproportionate resources across cpu, duration, reads, writes, memory, and executions*/
+    @primary_window nvarchar(20) = NULL, /*with @find_high_impact, restricts results to queries whose majority activity is in this window: business, off-hours, or weekend*/
     @help bit = 0, /*return available parameter details, etc.*/
     @debug bit = 0, /*prints dynamic sql, statement length, parameter and variable values, and raw temp table contents*/
     @troubleshoot_performance bit = 0, /*set statistics xml on for queries against views*/
@@ -39804,6 +40031,7 @@ BEGIN
                 WHEN N'@include_query_hash_totals' THEN N'will add an additional column to final output with total resource usage by query hash, may be skewed by query_hash and query_plan_hash bugs with forced plans/plan guides'
                 WHEN N'@include_maintenance' THEN N'Set this bit to 1 to add maintenance operations such as index creation to the result set'
                 WHEN N'@find_high_impact' THEN N'finds the vital few queries consuming disproportionate resources across cpu, duration, reads, writes, memory, and executions'
+                WHEN N'@primary_window' THEN N'with @find_high_impact, restricts results to queries whose majority activity is in this window (business, off-hours, or weekend)'
                 WHEN N'@help' THEN 'how you got here'
                 WHEN N'@debug' THEN 'prints dynamic sql, statement length, parameter and variable values, and raw temp table contents'
                 WHEN N'@troubleshoot_performance' THEN 'set statistics xml on for queries against views'
@@ -39866,6 +40094,7 @@ BEGIN
                 WHEN N'@include_query_hash_totals' THEN N'0 or 1'
                 WHEN N'@include_maintenance' THEN N'0 or 1'
                 WHEN N'@find_high_impact' THEN N'0 or 1'
+                WHEN N'@primary_window' THEN N'business, off-hours, or weekend (any unambiguous prefix works: b, biz, off, overnight, w, wknd, etc.)'
                 WHEN N'@help' THEN '0 or 1'
                 WHEN N'@debug' THEN '0 or 1'
                 WHEN N'@troubleshoot_performance' THEN '0 or 1'
@@ -39928,6 +40157,7 @@ BEGIN
                 WHEN N'@include_query_hash_totals' THEN N'0'
                 WHEN N'@include_maintenance' THEN N'0'
                 WHEN N'@find_high_impact' THEN N'0'
+                WHEN N'@primary_window' THEN N'NULL'
                 WHEN N'@help' THEN '0'
                 WHEN N'@debug' THEN '0'
                 WHEN N'@troubleshoot_performance' THEN '0'
@@ -40016,6 +40246,7 @@ BEGIN
     SELECT REPLICATE('-', 100) UNION ALL
     SELECT 'primary_window: when this query runs most. Business (during @work_start to @work_end on weekdays),' UNION ALL
     SELECT '    Off-hours (weekday nights), Weekend, or Spread (no single window > 50%). Percentage shown.' UNION ALL
+    SELECT '    Use @primary_window = ''business'' / ''off-hours'' / ''weekend'' to filter to queries whose majority activity falls in that window.' UNION ALL
     SELECT REPLICATE('-', 100) UNION ALL
     SELECT 'object_name: the stored procedure, function, or trigger this query belongs to, or "Adhoc" for ad hoc SQL' UNION ALL
     SELECT 'query_sql_text: representative query text (the most-executed variant for this query_hash)' UNION ALL
@@ -40035,6 +40266,8 @@ BEGIN
     SELECT 'cpu_share, duration_share, physical_reads_share, writes_share, memory_share, executions_share:' UNION ALL
     SELECT '    what percentage of the server''s total for that metric this single query_hash consumed.' UNION ALL
     SELECT '    This is the 80/20 answer: "this one query is X% of all CPU on the server."' UNION ALL
+    SELECT 'resource_metrics: clickable XML rollup of total/avg/min/max for cpu, duration, physical reads, writes, memory,' UNION ALL
+    SELECT '    tempdb, executions, rows, and max DOP. Click the column in SSMS to see the full breakdown.' UNION ALL
     SELECT REPLICATE('-', 100) UNION ALL
     SELECT 'diagnostics: rule-based signals layered on top of the score:' UNION ALL
     SELECT '    wait time (dur/cpu=Nx) - duration far exceeds CPU time, meaning the query spends most of its time waiting' UNION ALL
@@ -40376,6 +40609,27 @@ AND @find_high_impact = 1
 BEGIN
     RAISERROR('@log_to_table cannot be used with @find_high_impact. Run them separately.', 11, 1) WITH NOWAIT;
     RETURN;
+END;
+
+/*
+@primary_window only applies to the @find_high_impact path, and must
+match one of the three bucket labels by case-insensitive prefix: b/o/w
+*/
+IF @primary_window IS NOT NULL
+BEGIN
+    IF @find_high_impact = 0
+    BEGIN
+        RAISERROR('@primary_window only applies when @find_high_impact = 1.', 11, 1) WITH NOWAIT;
+        RETURN;
+    END;
+
+    IF  LOWER(@primary_window) NOT LIKE N'b%'
+    AND LOWER(@primary_window) NOT LIKE N'o%'
+    AND LOWER(@primary_window) NOT LIKE N'w%'
+    BEGIN
+        RAISERROR('@primary_window must start with b (business), o (off-hours), or w (weekend).', 11, 1) WITH NOWAIT;
+        RETURN;
+    END;
 END;
 
 /*
@@ -44431,6 +44685,7 @@ BEGIN
         rows_share decimal(5, 1) NULL,
         diagnostics nvarchar(4000) NULL,
         volatile_metrics nvarchar(4000) NULL,
+        resource_metrics xml NULL,
         total_cpu_ms decimal(38, 6) NULL,
         total_duration_ms decimal(38, 6) NULL,
         total_physical_reads_mb decimal(38, 6) NULL,
@@ -45787,6 +46042,7 @@ OPTION(RECOMPILE);' + @nc10;
         rows_share,
         diagnostics,
         volatile_metrics,
+        resource_metrics,
         total_cpu_ms,
         total_duration_ms,
         total_physical_reads_mb,
@@ -46138,6 +46394,40 @@ OPTION(RECOMPILE);' + @nc10;
                 2,
                 N''
             ),
+        resource_metrics =
+        (
+            SELECT
+                [cpu/@total_ms]            = s.total_cpu_ms,
+                [cpu/@avg_ms]              = s.avg_cpu_ms,
+                [cpu/@min_ms]              = s.min_cpu_ms,
+                [cpu/@max_ms]              = s.max_cpu_ms,
+                [duration/@total_ms]       = s.total_duration_ms,
+                [duration/@avg_ms]         = s.avg_duration_ms,
+                [duration/@min_ms]         = s.min_duration_ms,
+                [duration/@max_ms]         = s.max_duration_ms,
+                [physical_reads/@total_mb] = s.total_physical_reads_mb,
+                [physical_reads/@avg_mb]   = s.avg_physical_reads_mb,
+                [physical_reads/@min_mb]   = s.min_physical_reads_mb,
+                [physical_reads/@max_mb]   = s.max_physical_reads_mb,
+                [writes/@total_mb]         = s.total_writes_mb,
+                [writes/@avg_mb]           = s.avg_writes_mb,
+                [writes/@min_mb]           = s.min_writes_mb,
+                [writes/@max_mb]           = s.max_writes_mb,
+                [memory/@total_mb]         = s.total_memory_mb,
+                [memory/@avg_mb]           = s.avg_memory_mb,
+                [memory/@min_mb]           = s.min_memory_mb,
+                [memory/@max_mb]           = s.max_memory_mb,
+                [tempdb/@total_mb]         = s.total_tempdb_mb,
+                [tempdb/@avg_mb]           = s.avg_tempdb_mb,
+                [executions/@total]        = s.total_executions,
+                [rows/@total]              = s.total_rows,
+                [rows/@avg]                = s.avg_rows,
+                [parallelism/@max_dop]     = s.max_dop
+            FOR
+                XML
+                PATH(N'metrics'),
+                TYPE
+        ),
         s.total_cpu_ms,
         s.total_duration_ms,
         s.total_physical_reads_mb,
@@ -46270,14 +46560,7 @@ SELECT
     o.rows_share,
     o.diagnostics,
     o.volatile_metrics,
-    o.total_cpu_ms,
-    o.total_duration_ms,
-    o.total_physical_reads_mb,
-    o.total_writes_mb,
-    o.total_memory_mb,
-    o.total_tempdb_mb,
-    o.total_rows,
-    o.max_dop
+    o.resource_metrics
 FROM #hi_output AS o
 OUTER APPLY
 (
@@ -46304,7 +46587,18 @@ OUTER APPLY
     ) AS qp0
     WHERE qp0.n = 1
 ) AS qp
-ORDER BY
+' +
+    CASE
+        WHEN @primary_window IS NULL
+        THEN N''
+        WHEN LOWER(@primary_window) LIKE N'b%'
+        THEN N'WHERE o.primary_window LIKE N''Business%''' + @nc10
+        WHEN LOWER(@primary_window) LIKE N'o%'
+        THEN N'WHERE o.primary_window LIKE N''Off-hours%''' + @nc10
+        WHEN LOWER(@primary_window) LIKE N'w%'
+        THEN N'WHERE o.primary_window LIKE N''Weekend%''' + @nc10
+        ELSE N''
+    END + N'ORDER BY
     o.impact_score DESC,
     ' +
     CASE LOWER(@sort_order)
@@ -53684,6 +53978,8 @@ BEGIN
             @include_maintenance,
         find_high_impact =
             @find_high_impact,
+        primary_window =
+            @primary_window,
         help =
             @help,
         debug =
