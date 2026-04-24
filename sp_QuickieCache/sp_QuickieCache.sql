@@ -1736,6 +1736,9 @@ OPTION(RECOMPILE, MAXDOP 1);';
         high_signals nvarchar(500) NULL,
         diagnostics nvarchar(max) NULL,
 
+        /* resource rollup */
+        resource_metrics xml NULL,
+
         /* plan metadata */
         oldest_plan_creation datetime NULL,
         newest_plan_creation datetime NULL,
@@ -1792,6 +1795,7 @@ OPTION(RECOMPILE, MAXDOP 1);';
         grant_pctl,
         spills_pctl,
         executions_pctl,
+        resource_metrics,
         oldest_plan_creation,
         newest_plan_creation,
         last_execution_time,
@@ -1954,6 +1958,44 @@ OPTION(RECOMPILE, MAXDOP 1);';
                      )
                 ELSE NULL
             END,
+
+        resource_metrics =
+        (
+            SELECT
+                [cpu/@total_ms]              = qs.total_cpu_ms,
+                [cpu/@avg_ms]                = qs.total_cpu_ms / NULLIF(qs.total_executions, 0),
+                [cpu/@min_ms]                = qs.min_cpu_ms,
+                [cpu/@max_ms]                = qs.max_cpu_ms,
+                [duration/@total_ms]         = qs.total_duration_ms,
+                [duration/@avg_ms]           = qs.total_duration_ms / NULLIF(qs.total_executions, 0),
+                [duration/@min_ms]           = qs.min_duration_ms,
+                [duration/@max_ms]           = qs.max_duration_ms,
+                [physical_reads/@total]      = qs.total_physical_reads,
+                [physical_reads/@avg]        = CONVERT(decimal(38, 2), qs.total_physical_reads) / NULLIF(qs.total_executions, 0),
+                [physical_reads/@min]        = qs.min_physical_reads,
+                [physical_reads/@max]        = qs.max_physical_reads,
+                [logical_writes/@total]      = qs.total_logical_writes,
+                [logical_writes/@avg]        = CONVERT(decimal(38, 2), qs.total_logical_writes) / NULLIF(qs.total_executions, 0),
+                [rows/@total]                = qs.total_rows,
+                [rows/@avg]                  = CONVERT(decimal(38, 2), qs.total_rows) / NULLIF(qs.total_executions, 0),
+                [rows/@min]                  = qs.min_rows,
+                [rows/@max]                  = qs.max_rows,
+                [grant/@total_mb]            = qs.total_grant_mb,
+                [grant/@avg_mb]              = qs.total_grant_mb / NULLIF(qs.total_executions, 0),
+                [grant/@max_mb]              = qs.max_grant_mb,
+                [used_grant/@total_mb]       = qs.total_used_grant_mb,
+                [used_grant/@avg_mb]         = qs.total_used_grant_mb / NULLIF(qs.total_executions, 0),
+                [used_grant/@max_mb]         = qs.max_used_grant_mb,
+                [spills/@total]              = qs.total_spills,
+                [spills/@avg]                = CONVERT(decimal(38, 2), qs.total_spills) / NULLIF(qs.total_executions, 0),
+                [spills/@max]                = qs.max_spills,
+                [executions/@total]          = qs.total_executions,
+                [parallelism/@max_dop]       = qs.max_dop
+            FOR
+                XML
+                PATH(N'metrics'),
+                TYPE
+        ),
 
         oldest_plan_creation = qs.oldest_plan_creation,
         newest_plan_creation = qs.newest_plan_creation,
@@ -2338,18 +2380,7 @@ OPTION(RECOMPILE, MAXDOP 1);';
         s.spills_share,
         s.executions_share,
         s.diagnostics,
-        s.total_cpu_ms,
-        s.total_duration_ms,
-        s.total_physical_reads,
-        s.total_logical_writes,
-        s.total_grant_mb,
-        s.total_spills,
-        s.max_grant_mb,
-        s.max_used_grant_mb,
-        s.max_spills,
-        s.max_dop,
-        s.min_rows,
-        s.max_rows,
+        s.resource_metrics,
         s.oldest_plan_creation,
         s.last_execution_time,
         s.sample_sql_handle,
