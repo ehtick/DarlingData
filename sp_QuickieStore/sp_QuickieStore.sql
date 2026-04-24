@@ -102,6 +102,7 @@ ALTER PROCEDURE
     @include_query_hash_totals bit = 0, /*will add an additional column to final output with total resource usage by query hash, may be skewed by query_hash and query_plan_hash bugs with forced plans/plan guides*/
     @include_maintenance bit = 0, /*Set this bit to 1 to add maintenance operations such as index creation to the result set*/
     @find_high_impact bit = 0, /*finds the vital few queries consuming disproportionate resources across cpu, duration, reads, writes, memory, and executions*/
+    @primary_window nvarchar(20) = NULL, /*with @find_high_impact, restricts results to queries whose majority activity is in this window: business, off-hours, or weekend*/
     @help bit = 0, /*return available parameter details, etc.*/
     @debug bit = 0, /*prints dynamic sql, statement length, parameter and variable values, and raw temp table contents*/
     @troubleshoot_performance bit = 0, /*set statistics xml on for queries against views*/
@@ -204,6 +205,7 @@ BEGIN
                 WHEN N'@include_query_hash_totals' THEN N'will add an additional column to final output with total resource usage by query hash, may be skewed by query_hash and query_plan_hash bugs with forced plans/plan guides'
                 WHEN N'@include_maintenance' THEN N'Set this bit to 1 to add maintenance operations such as index creation to the result set'
                 WHEN N'@find_high_impact' THEN N'finds the vital few queries consuming disproportionate resources across cpu, duration, reads, writes, memory, and executions'
+                WHEN N'@primary_window' THEN N'with @find_high_impact, restricts results to queries whose majority activity is in this window (business, off-hours, or weekend)'
                 WHEN N'@help' THEN 'how you got here'
                 WHEN N'@debug' THEN 'prints dynamic sql, statement length, parameter and variable values, and raw temp table contents'
                 WHEN N'@troubleshoot_performance' THEN 'set statistics xml on for queries against views'
@@ -266,6 +268,7 @@ BEGIN
                 WHEN N'@include_query_hash_totals' THEN N'0 or 1'
                 WHEN N'@include_maintenance' THEN N'0 or 1'
                 WHEN N'@find_high_impact' THEN N'0 or 1'
+                WHEN N'@primary_window' THEN N'business, off-hours, or weekend (any unambiguous prefix works: b, biz, off, overnight, w, wknd, etc.)'
                 WHEN N'@help' THEN '0 or 1'
                 WHEN N'@debug' THEN '0 or 1'
                 WHEN N'@troubleshoot_performance' THEN '0 or 1'
@@ -328,6 +331,7 @@ BEGIN
                 WHEN N'@include_query_hash_totals' THEN N'0'
                 WHEN N'@include_maintenance' THEN N'0'
                 WHEN N'@find_high_impact' THEN N'0'
+                WHEN N'@primary_window' THEN N'NULL'
                 WHEN N'@help' THEN '0'
                 WHEN N'@debug' THEN '0'
                 WHEN N'@troubleshoot_performance' THEN '0'
@@ -416,6 +420,7 @@ BEGIN
     SELECT REPLICATE('-', 100) UNION ALL
     SELECT 'primary_window: when this query runs most. Business (during @work_start to @work_end on weekdays),' UNION ALL
     SELECT '    Off-hours (weekday nights), Weekend, or Spread (no single window > 50%). Percentage shown.' UNION ALL
+    SELECT '    Use @primary_window = ''business'' / ''off-hours'' / ''weekend'' to filter to queries whose majority activity falls in that window.' UNION ALL
     SELECT REPLICATE('-', 100) UNION ALL
     SELECT 'object_name: the stored procedure, function, or trigger this query belongs to, or "Adhoc" for ad hoc SQL' UNION ALL
     SELECT 'query_sql_text: representative query text (the most-executed variant for this query_hash)' UNION ALL
@@ -435,6 +440,8 @@ BEGIN
     SELECT 'cpu_share, duration_share, physical_reads_share, writes_share, memory_share, executions_share:' UNION ALL
     SELECT '    what percentage of the server''s total for that metric this single query_hash consumed.' UNION ALL
     SELECT '    This is the 80/20 answer: "this one query is X% of all CPU on the server."' UNION ALL
+    SELECT 'resource_metrics: clickable XML rollup of total/avg/min/max for cpu, duration, physical reads, writes, memory,' UNION ALL
+    SELECT '    tempdb, executions, rows, and max DOP. Click the column in SSMS to see the full breakdown.' UNION ALL
     SELECT REPLICATE('-', 100) UNION ALL
     SELECT 'diagnostics: rule-based signals layered on top of the score:' UNION ALL
     SELECT '    wait time (dur/cpu=Nx) - duration far exceeds CPU time, meaning the query spends most of its time waiting' UNION ALL
@@ -776,6 +783,27 @@ AND @find_high_impact = 1
 BEGIN
     RAISERROR('@log_to_table cannot be used with @find_high_impact. Run them separately.', 11, 1) WITH NOWAIT;
     RETURN;
+END;
+
+/*
+@primary_window only applies to the @find_high_impact path, and must
+match one of the three bucket labels by case-insensitive prefix: b/o/w
+*/
+IF @primary_window IS NOT NULL
+BEGIN
+    IF @find_high_impact = 0
+    BEGIN
+        RAISERROR('@primary_window only applies when @find_high_impact = 1.', 11, 1) WITH NOWAIT;
+        RETURN;
+    END;
+
+    IF  LOWER(@primary_window) NOT LIKE N'b%'
+    AND LOWER(@primary_window) NOT LIKE N'o%'
+    AND LOWER(@primary_window) NOT LIKE N'w%'
+    BEGIN
+        RAISERROR('@primary_window must start with b (business), o (off-hours), or w (weekend).', 11, 1) WITH NOWAIT;
+        RETURN;
+    END;
 END;
 
 /*
@@ -4831,6 +4859,7 @@ BEGIN
         rows_share decimal(5, 1) NULL,
         diagnostics nvarchar(4000) NULL,
         volatile_metrics nvarchar(4000) NULL,
+        resource_metrics xml NULL,
         total_cpu_ms decimal(38, 6) NULL,
         total_duration_ms decimal(38, 6) NULL,
         total_physical_reads_mb decimal(38, 6) NULL,
@@ -6187,6 +6216,7 @@ OPTION(RECOMPILE);' + @nc10;
         rows_share,
         diagnostics,
         volatile_metrics,
+        resource_metrics,
         total_cpu_ms,
         total_duration_ms,
         total_physical_reads_mb,
@@ -6538,6 +6568,40 @@ OPTION(RECOMPILE);' + @nc10;
                 2,
                 N''
             ),
+        resource_metrics =
+        (
+            SELECT
+                [cpu/@total_ms]            = s.total_cpu_ms,
+                [cpu/@avg_ms]              = s.avg_cpu_ms,
+                [cpu/@min_ms]              = s.min_cpu_ms,
+                [cpu/@max_ms]              = s.max_cpu_ms,
+                [duration/@total_ms]       = s.total_duration_ms,
+                [duration/@avg_ms]         = s.avg_duration_ms,
+                [duration/@min_ms]         = s.min_duration_ms,
+                [duration/@max_ms]         = s.max_duration_ms,
+                [physical_reads/@total_mb] = s.total_physical_reads_mb,
+                [physical_reads/@avg_mb]   = s.avg_physical_reads_mb,
+                [physical_reads/@min_mb]   = s.min_physical_reads_mb,
+                [physical_reads/@max_mb]   = s.max_physical_reads_mb,
+                [writes/@total_mb]         = s.total_writes_mb,
+                [writes/@avg_mb]           = s.avg_writes_mb,
+                [writes/@min_mb]           = s.min_writes_mb,
+                [writes/@max_mb]           = s.max_writes_mb,
+                [memory/@total_mb]         = s.total_memory_mb,
+                [memory/@avg_mb]           = s.avg_memory_mb,
+                [memory/@min_mb]           = s.min_memory_mb,
+                [memory/@max_mb]           = s.max_memory_mb,
+                [tempdb/@total_mb]         = s.total_tempdb_mb,
+                [tempdb/@avg_mb]           = s.avg_tempdb_mb,
+                [executions/@total]        = s.total_executions,
+                [rows/@total]              = s.total_rows,
+                [rows/@avg]                = s.avg_rows,
+                [parallelism/@max_dop]     = s.max_dop
+            FOR
+                XML
+                PATH(N'metrics'),
+                TYPE
+        ),
         s.total_cpu_ms,
         s.total_duration_ms,
         s.total_physical_reads_mb,
@@ -6670,14 +6734,7 @@ SELECT
     o.rows_share,
     o.diagnostics,
     o.volatile_metrics,
-    o.total_cpu_ms,
-    o.total_duration_ms,
-    o.total_physical_reads_mb,
-    o.total_writes_mb,
-    o.total_memory_mb,
-    o.total_tempdb_mb,
-    o.total_rows,
-    o.max_dop
+    o.resource_metrics
 FROM #hi_output AS o
 OUTER APPLY
 (
@@ -6704,7 +6761,18 @@ OUTER APPLY
     ) AS qp0
     WHERE qp0.n = 1
 ) AS qp
-ORDER BY
+' +
+    CASE
+        WHEN @primary_window IS NULL
+        THEN N''
+        WHEN LOWER(@primary_window) LIKE N'b%'
+        THEN N'WHERE o.primary_window LIKE N''Business%''' + @nc10
+        WHEN LOWER(@primary_window) LIKE N'o%'
+        THEN N'WHERE o.primary_window LIKE N''Off-hours%''' + @nc10
+        WHEN LOWER(@primary_window) LIKE N'w%'
+        THEN N'WHERE o.primary_window LIKE N''Weekend%''' + @nc10
+        ELSE N''
+    END + N'ORDER BY
     o.impact_score DESC,
     ' +
     CASE LOWER(@sort_order)
@@ -14084,6 +14152,8 @@ BEGIN
             @include_maintenance,
         find_high_impact =
             @find_high_impact,
+        primary_window =
+            @primary_window,
         help =
             @help,
         debug =

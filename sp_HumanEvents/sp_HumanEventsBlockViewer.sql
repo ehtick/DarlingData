@@ -3594,46 +3594,146 @@ BEGIN
         RAISERROR('Inserting #block_findings, check_id 9', 0, 1) WITH NOWAIT;
     END;
 
+    /*
+    Build a session-to-lead-blocker map per monitor_loop.
+    A "lead blocker" is a session at the top of a blocking chain that
+    isn't itself being blocked by anyone else in that monitor_loop.
+    Every other (session_desc) in the chain is mapped to that lead so
+    their victim wait time cascades up to the true root cause rather
+    than being misattributed to an intermediate blocker that was just
+    stuck behind someone.
+    */
+    CREATE TABLE
+        #session_leads
+    (
+        monitor_loop integer NOT NULL,
+        lead_desc varchar(22) NOT NULL,
+        session_desc varchar(22) NOT NULL
+    );
+
+    CREATE CLUSTERED INDEX
+        cx_session_leads
+    ON #session_leads
+        (monitor_loop, session_desc);
+
     WITH
-        blocker_waits AS
+        walk
+    AS
+    (
+        /*
+        Anchor: a lead blocker never appears as a blocked_desc in the
+        same monitor_loop (nobody is blocking them).
+        */
+        SELECT
+            monitor_loop =
+                b.monitor_loop,
+            lead_desc =
+                b.blocking_desc,
+            session_desc =
+                b.blocking_desc,
+            lead_path =
+                CONVERT(varchar(400), b.blocking_desc)
+        FROM #blocking AS b
+        WHERE NOT EXISTS
+        (
+            SELECT
+                1/0
+            FROM #blocking AS b2
+            WHERE b2.monitor_loop = b.monitor_loop
+            AND   b2.blocked_desc = b.blocking_desc
+        )
+
+        UNION ALL
+
+        /*
+        Recursive step: whoever the current session blocks inherits
+        the same lead. Cycle guard mirrors the existing hierarchy CTE
+        pattern (line ~2219) — skip a blocked_desc already on this path.
+        */
+        SELECT
+            w.monitor_loop,
+            w.lead_desc,
+            next_hop.blocked_desc,
+            CONVERT
+            (
+                varchar(400),
+                w.lead_path + ' ' + next_hop.blocked_desc
+            )
+        FROM walk AS w
+        JOIN #blocking AS next_hop
+          ON  next_hop.monitor_loop = w.monitor_loop
+          AND next_hop.blocking_desc = w.session_desc
+        WHERE w.lead_path NOT LIKE '%' + next_hop.blocked_desc + '%'
+    )
+    INSERT
+        #session_leads WITH (TABLOCK)
+    (
+        monitor_loop,
+        lead_desc,
+        session_desc
+    )
+    SELECT DISTINCT
+        w.monitor_loop,
+        w.lead_desc,
+        w.session_desc
+    FROM walk AS w
+    OPTION(RECOMPILE, MAXRECURSION 100);
+
+    /*
+    Cycle fallback: if every session in a monitor_loop is blocked by
+    someone else (true cycle, pre-deadlock-detection), the anchor
+    produces no rows and those blocking_descs don't land in the map.
+    Treat any unmapped blocking_desc as its own lead so their waits
+    aren't dropped from the rollup.
+    */
+    INSERT
+        #session_leads WITH (TABLOCK)
+    (
+        monitor_loop,
+        lead_desc,
+        session_desc
+    )
+    SELECT DISTINCT
+        b.monitor_loop,
+        b.blocking_desc,
+        b.blocking_desc
+    FROM #blocking AS b
+    WHERE NOT EXISTS
     (
         SELECT
+            1/0
+        FROM #session_leads AS sl
+        WHERE sl.monitor_loop = b.monitor_loop
+        AND   sl.session_desc = b.blocking_desc
+    )
+    OPTION(RECOMPILE);
+
+    IF @debug = 1
+    BEGIN
+        SELECT
+            '#session_leads' AS table_name,
+            sl.*
+        FROM #session_leads AS sl
+        OPTION(RECOMPILE);
+    END;
+
+    WITH
+        bpr_with_lead AS
+    (
+        /*
+        Each BPR's victim wait, attributed to the blocker's chain lead.
+        The @database_name and @object_name filters apply to the BPR
+        (where the blocking actually happened); the chain walk itself
+        was done against the full monitor_loop so we can correctly
+        trace waits that cascade across objects.
+        */
+        SELECT
+            sl.lead_desc,
+            b.monitor_loop,
             b.database_name,
-            query_text_pre =
-                b.query_text_pre,
+            b.blocked_desc,
             b.transaction_id,
-            sql_handle =
-                CONVERT
-                (
-                    varbinary(64),
-                    b.blocked_process_report.value
-                    (
-                        '(/event/data/value/blocked-process-report/blocking-process/process/executionStack/frame[not(@sqlhandle = "0x0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000")]/@sqlhandle)[1]',
-                        'varchar(130)'
-                    ),
-                    1
-                ),
-            stmtstart =
-                ISNULL
-                (
-                    b.blocked_process_report.value
-                    (
-                        '(/event/data/value/blocked-process-report/blocking-process/process/executionStack/frame[not(@sqlhandle = "0x0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000")]/@stmtstart)[1]',
-                        'integer'
-                    ),
-                    0
-                ),
-            stmtend =
-                ISNULL
-                (
-                    b.blocked_process_report.value
-                    (
-                        '(/event/data/value/blocked-process-report/blocking-process/process/executionStack/frame[not(@sqlhandle = "0x0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000")]/@stmtend)[1]',
-                        'integer'
-                    ),
-                    -1
-                ),
-            wait_time_ms =
+            victim_wait_time_ms =
                 ISNULL
                 (
                     b.blocked_process_report.value
@@ -3643,33 +3743,128 @@ BEGIN
                     ),
                     0
                 )
-        FROM #blocks AS b
-        WHERE b.activity = 'blocking'
-        AND   (b.database_name = @database_name
-               OR @database_name IS NULL)
-        AND   (b.contentious_object = @object_name
-               OR @object_name IS NULL)
+        FROM #blocking AS b
+        JOIN #session_leads AS sl
+          ON  sl.monitor_loop = b.monitor_loop
+          AND sl.session_desc = b.blocking_desc
+        CROSS APPLY
+        (
+            SELECT
+                contentious_object =
+                    ISNULL
+                    (
+                        OBJECT_SCHEMA_NAME(b.object_id, b.database_id) +
+                        N'.' +
+                        OBJECT_NAME(b.object_id, b.database_id),
+                        N''
+                    )
+        ) AS co
+        WHERE
+        (
+            b.database_name = @database_name
+         OR @database_name IS NULL
+        )
+        AND
+        (
+            co.contentious_object = @object_name
+         OR @object_name IS NULL
+        )
     ),
-        blocker_per_victim AS
+        lead_sql AS
     (
+        /*
+        Representative sql_handle / stmtstart / stmtend for each
+        (monitor_loop, lead_desc). Pulled from any #blocking row where
+        the lead appears as the blocking-process. MAX is deterministic
+        across repeat BPR fires within the same monitor_loop.
+        */
         SELECT
-            bw.database_name,
-            bw.sql_handle,
-            bw.stmtstart,
-            bw.stmtend,
-            bw.query_text_pre,
-            bw.transaction_id,
-            wait_time_ms =
-                MAX(bw.wait_time_ms)
-        FROM blocker_waits AS bw
-        WHERE bw.sql_handle IS NOT NULL
+            b.monitor_loop,
+            lead_desc =
+                b.blocking_desc,
+            sql_handle =
+                CONVERT
+                (
+                    varbinary(64),
+                    MAX
+                    (
+                        b.blocked_process_report.value
+                        (
+                            '(/event/data/value/blocked-process-report/blocking-process/process/executionStack/frame[not(@sqlhandle = "0x0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000")]/@sqlhandle)[1]',
+                            'varchar(130)'
+                        )
+                    ),
+                    1
+                ),
+            stmtstart =
+                ISNULL
+                (
+                    MAX
+                    (
+                        b.blocked_process_report.value
+                        (
+                            '(/event/data/value/blocked-process-report/blocking-process/process/executionStack/frame[not(@sqlhandle = "0x0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000")]/@stmtstart)[1]',
+                            'integer'
+                        )
+                    ),
+                    0
+                ),
+            stmtend =
+                ISNULL
+                (
+                    MAX
+                    (
+                        b.blocked_process_report.value
+                        (
+                            '(/event/data/value/blocked-process-report/blocking-process/process/executionStack/frame[not(@sqlhandle = "0x0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000")]/@stmtend)[1]',
+                            'integer'
+                        )
+                    ),
+                    -1
+                ),
+            query_text_pre =
+                MAX(b.query_text_pre)
+        FROM #blocking AS b
+        WHERE EXISTS
+        (
+            SELECT
+                1/0
+            FROM #session_leads AS sl
+            WHERE sl.monitor_loop = b.monitor_loop
+            AND   sl.lead_desc = b.blocking_desc
+        )
         GROUP BY
-            bw.database_name,
-            bw.sql_handle,
-            bw.stmtstart,
-            bw.stmtend,
-            bw.query_text_pre,
-            bw.transaction_id
+            b.monitor_loop,
+            b.blocking_desc
+    ),
+        per_victim AS
+    (
+        /*
+        Dedup: one row per (lead_query_identity, victim_tx) with peak
+        wait, matching the existing pattern (MAX across monitor_loops
+        for the same victim rather than summing repeat BPR fires).
+        */
+        SELECT
+            bl.database_name,
+            ls.sql_handle,
+            ls.stmtstart,
+            ls.stmtend,
+            bl.transaction_id,
+            wait_time_ms =
+                MAX(bl.victim_wait_time_ms),
+            query_text_pre =
+                MAX(ls.query_text_pre)
+        FROM bpr_with_lead AS bl
+        JOIN lead_sql AS ls
+          ON  ls.monitor_loop = bl.monitor_loop
+          AND ls.lead_desc = bl.lead_desc
+        WHERE ls.sql_handle IS NOT NULL
+        GROUP BY
+            bl.database_name,
+            ls.sql_handle,
+            ls.stmtstart,
+            ls.stmtend,
+            bl.transaction_id
     )
     INSERT
         #block_findings
@@ -3684,7 +3879,7 @@ BEGIN
     SELECT
         check_id =
             9,
-        bpv.database_name,
+        pv.database_name,
         object_name =
             LEFT
             (
@@ -3694,7 +3889,7 @@ BEGIN
                     (
                         ISNULL
                         (
-                            MAX(bpv.query_text_pre),
+                            MAX(pv.query_text_pre),
                             N'[Unknown]'
                         ),
                         NCHAR(13),
@@ -3706,9 +3901,9 @@ BEGIN
                 200
             ),
         finding_group =
-            N'Top Blocking Query',
+            N'Top Lead Blocker',
         finding =
-            N'This query caused ' +
+            N'This lead blocker accounted for ' +
             CONVERT
             (
                 nvarchar(30),
@@ -3718,7 +3913,7 @@ BEGIN
                         CONVERT
                         (
                             bigint,
-                            bpv.wait_time_ms
+                            pv.wait_time_ms
                         )
                     ) / 1000 / 86400
                 )
@@ -3736,7 +3931,7 @@ BEGIN
                             CONVERT
                             (
                                 bigint,
-                                bpv.wait_time_ms
+                                pv.wait_time_ms
                             )
                         ) / 1000 % 86400
                     ),
@@ -3759,7 +3954,7 @@ BEGIN
                             CONVERT
                             (
                                 bigint,
-                                bpv.wait_time_ms
+                                pv.wait_time_ms
                             )
                         ) /
                         NULLIF
@@ -3771,7 +3966,7 @@ BEGIN
                                     CONVERT
                                     (
                                         bigint,
-                                        bpv.wait_time_ms
+                                        pv.wait_time_ms
                                     )
                                 )
                             ) OVER (),
@@ -3785,9 +3980,9 @@ BEGIN
             CONVERT
             (
                 nvarchar(20),
-                COUNT_BIG(DISTINCT bpv.transaction_id)
+                COUNT_BIG(DISTINCT pv.transaction_id)
             ) +
-            N' blocked sessions.',
+            N' blocked sessions in its chain.',
        sort_order =
            ROW_NUMBER() OVER
            (
@@ -3797,22 +3992,22 @@ BEGIN
                        CONVERT
                        (
                            bigint,
-                           bpv.wait_time_ms
+                           pv.wait_time_ms
                        )
                    ) DESC
            )
-    FROM blocker_per_victim AS bpv
+    FROM per_victim AS pv
     GROUP BY
-        bpv.database_name,
-        bpv.sql_handle,
-        bpv.stmtstart,
-        bpv.stmtend
+        pv.database_name,
+        pv.sql_handle,
+        pv.stmtstart,
+        pv.stmtend
     HAVING
-        SUM(CONVERT(bigint, bpv.wait_time_ms)) * 10 >=
+        SUM(CONVERT(bigint, pv.wait_time_ms)) * 10 >=
         (
             SELECT
-                SUM(CONVERT(bigint, bpv2.wait_time_ms))
-            FROM blocker_per_victim AS bpv2
+                SUM(CONVERT(bigint, pv2.wait_time_ms))
+            FROM per_victim AS pv2
         )
     OPTION(RECOMPILE);
 
