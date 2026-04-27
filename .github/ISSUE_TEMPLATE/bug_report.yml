@@ -90,6 +90,16 @@ body:
       required: false
 
   - type: textarea
+    id: debug
+    attributes:
+      label: Debug Output
+      description: |
+        If the script supports `@debug = 1` (sp_QuickieStore, sp_HealthParser, sp_PressureDetector, sp_PerfCheck, sp_IndexCleanup, sp_LogHunter, sp_HumanEvents, sp_QueryStoreCleanup, sp_QueryReproBuilder), please re-run with `@debug = 1` and paste the **Messages tab** output — especially the last `current_table` value and the failing dynamic SQL block. This pinpoints which section is broken and is usually all we need to ship a fix.
+      render: text
+    validations:
+      required: false
+
+  - type: textarea
     id: context
     attributes:
       label: Additional Context
