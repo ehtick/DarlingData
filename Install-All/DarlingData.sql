@@ -1,4 +1,4 @@
--- Compile Date: 04/24/2026 18:36:07 UTC
+-- Compile Date: 04/27/2026 23:04:36 UTC
 SET ANSI_NULLS ON;
 SET ANSI_PADDING ON;
 SET ANSI_WARNINGS ON;
@@ -17304,49 +17304,60 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
         column_name = c.name,
         definition = cc.definition,
         /*
-        UDF detection: Looks for schema-qualified object references like [schema].[function]
-        Note: This is a heuristic check and may have rare false positives if ].[  appears
-        in string literals or comments within the computed column definition
+        UDF detection: Uses sys.sql_expression_dependencies, filtered to user-defined
+        function object types (FN, IF, TF, FS, FT). This avoids the false positives
+        the previous string-heuristic produced for schema-qualified type names,
+        system functions called as [sys].[fn_xxx](), and ].[ embedded in string
+        literals or comments.
         */
         contains_udf =
             CASE
-                WHEN cc.definition LIKE ''%|].|[%'' ESCAPE ''|''
-                AND  cc.definition LIKE ''%|].|[%(%'' ESCAPE ''|''
+                WHEN refs.udf_names IS NOT NULL
                 THEN 1
                 ELSE 0
             END,
-        udf_names =
-            CASE
-                WHEN cc.definition LIKE ''%|].|[%'' ESCAPE ''|''
-                AND  cc.definition LIKE ''%|].|[%(%'' ESCAPE ''|''
-                AND  CHARINDEX(N''['', cc.definition) > 0
-                AND  CHARINDEX(N''].['', cc.definition) > 0
-                AND  CHARINDEX(N'']'', cc.definition, CHARINDEX(N''].['', cc.definition) + 3) > 0
-                THEN
-                    SUBSTRING
-                    (
-                        cc.definition,
-                        CHARINDEX(N''['', cc.definition),
-                        CHARINDEX
-                        (
-                            N'']'',
-                            cc.definition,
-                            CHARINDEX
-                            (
-                                N''].['',
-                                cc.definition
-                            ) + 3
-                        ) -
-                        CHARINDEX(N''['', cc.definition) + 1
-                    )
-                ELSE NULL
-            END
+        udf_names = refs.udf_names
     FROM #filtered_objects AS fo
     JOIN ' + QUOTENAME(@current_database_name) + N'.sys.columns AS c
       ON fo.object_id = c.object_id
     JOIN ' + QUOTENAME(@current_database_name) + N'.sys.computed_columns AS cc
       ON  c.object_id = cc.object_id
       AND c.column_id = cc.column_id
+    OUTER APPLY
+    (
+        SELECT
+            udf_names =
+                STUFF
+                (
+                    (
+                        SELECT
+                            N'', '' +
+                            QUOTENAME(s.name) +
+                            N''.'' +
+                            QUOTENAME(o.name)
+                        FROM ' + QUOTENAME(@current_database_name) + N'.sys.sql_expression_dependencies AS sed
+                        JOIN ' + QUOTENAME(@current_database_name) + N'.sys.objects AS o
+                          ON o.object_id = sed.referenced_id
+                        JOIN ' + QUOTENAME(@current_database_name) + N'.sys.schemas AS s
+                          ON s.schema_id = o.schema_id
+                        WHERE sed.referencing_id = cc.object_id
+                        AND   sed.referencing_minor_id = cc.column_id
+                        AND   sed.referencing_class = 1
+                        AND   sed.referenced_class = 1
+                        AND   o.type IN (N''FN'', N''IF'', N''TF'', N''FS'', N''FT'')
+                        ORDER BY
+                            s.name,
+                            o.name
+                        FOR
+                            XML
+                            PATH(N''''),
+                            TYPE
+                    ).value(''.'', ''nvarchar(max)''),
+                    1,
+                    2,
+                    N''''
+                )
+    ) AS refs
     OPTION(RECOMPILE);';
 
     IF @debug = 1
@@ -17401,46 +17412,56 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
         constraint_name = cc.name,
         definition = cc.definition,
         /*
-        UDF detection: Looks for schema-qualified object references like [schema].[function]
-        Note: This is a heuristic check and may have rare false positives if ].[  appears
-        in string literals or comments within the computed column definition
+        UDF detection: Uses sys.sql_expression_dependencies, filtered to user-defined
+        function object types (FN, IF, TF, FS, FT). This avoids the false positives
+        the previous string-heuristic produced for schema-qualified type names,
+        system functions called as [sys].[fn_xxx](), and ].[ embedded in string
+        literals or comments.
         */
         contains_udf =
             CASE
-                WHEN cc.definition LIKE ''%|].|[%'' ESCAPE ''|''
-                AND  cc.definition LIKE ''%|].|[%(%'' ESCAPE ''|''
+                WHEN refs.udf_names IS NOT NULL
                 THEN 1
                 ELSE 0
             END,
-        udf_names =
-            CASE
-                WHEN cc.definition LIKE ''%|].|[%'' ESCAPE ''|''
-                AND  cc.definition LIKE ''%|].|[%(%'' ESCAPE ''|''
-                AND  CHARINDEX(N''['', cc.definition) > 0
-                AND  CHARINDEX(N''].['', cc.definition) > 0
-                AND  CHARINDEX(N'']'', cc.definition, CHARINDEX(N''].['', cc.definition) + 3) > 0
-                THEN
-                    SUBSTRING
-                    (
-                        cc.definition,
-                        CHARINDEX(N''['', cc.definition),
-                        CHARINDEX
-                        (
-                            N'']'',
-                            cc.definition,
-                            CHARINDEX
-                            (
-                                N''].['',
-                                cc.definition
-                            ) + 3
-                        ) -
-                        CHARINDEX(N''['', cc.definition) + 1
-                    )
-                ELSE NULL
-            END
+        udf_names = refs.udf_names
     FROM #filtered_objects AS fo
     JOIN ' + QUOTENAME(@current_database_name) + N'.sys.check_constraints AS cc
       ON fo.object_id = cc.parent_object_id
+    OUTER APPLY
+    (
+        SELECT
+            udf_names =
+                STUFF
+                (
+                    (
+                        SELECT
+                            N'', '' +
+                            QUOTENAME(s.name) +
+                            N''.'' +
+                            QUOTENAME(o.name)
+                        FROM ' + QUOTENAME(@current_database_name) + N'.sys.sql_expression_dependencies AS sed
+                        JOIN ' + QUOTENAME(@current_database_name) + N'.sys.objects AS o
+                          ON o.object_id = sed.referenced_id
+                        JOIN ' + QUOTENAME(@current_database_name) + N'.sys.schemas AS s
+                          ON s.schema_id = o.schema_id
+                        WHERE sed.referencing_id = cc.object_id
+                        AND   sed.referencing_class = 1
+                        AND   sed.referenced_class = 1
+                        AND   o.type IN (N''FN'', N''IF'', N''TF'', N''FS'', N''FT'')
+                        ORDER BY
+                            s.name,
+                            o.name
+                        FOR
+                            XML
+                            PATH(N''''),
+                            TYPE
+                    ).value(''.'', ''nvarchar(max)''),
+                    1,
+                    2,
+                    N''''
+                )
+    ) AS refs
     OPTION(RECOMPILE);';
 
     IF @debug = 1
@@ -19645,7 +19666,19 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
             ),
         table_name = N'brought to you by erikdarling.com',
         index_name = N'for support: https://code.erikdarling.com/',
-        consolidation_rule = N'run date: ' + CONVERT(nvarchar(30), SYSDATETIME(), 120),
+        consolidation_rule =
+            N'run date: ' +
+            CONVERT(nvarchar(30), SYSDATETIME(), 120) +
+            N' | ' +
+            CASE
+                WHEN @uptime_warning = 1
+                THEN N'WARNING: Server uptime only ' +
+                     @uptime_days +
+                     N' days - usage data may be incomplete!'
+                ELSE N'Server uptime: ' +
+                     @uptime_days +
+                     N' days'
+            END,
         script_type = N'Index Cleanup Scripts',
         additional_info = N'A detailed index analysis report appears after these scripts',
         target_index_name = N'ALWAYS TEST THESE RECOMMENDATIONS',
