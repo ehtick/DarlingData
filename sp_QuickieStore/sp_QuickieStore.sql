@@ -11127,7 +11127,7 @@ WHERE EXISTS
           SELECT
               1/0
           FROM #query_store_plan AS qsp
-          WHERE plan_force_flat.regressed_plan_id = qsp.plan_id
+          WHERE TRY_CAST(plan_force_flat.regressed_plan_id AS bigint) = qsp.plan_id
       )
 OPTION(RECOMPILE);' + @nc10;
 
