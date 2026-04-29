@@ -127,8 +127,8 @@ BEGIN TRY
 These are for your outputs.
 */
 SELECT
-    @version = '6.5',
-    @version_date = '20260420';
+    @version = '6.6',
+    @version_date = '20260501';
 
 /*
 Helpful section! For help.
@@ -11082,30 +11082,42 @@ FROM
         plan_force_json.score,
         plan_force_json.last_refresh,
         regressed_plan_id =
-            SUBSTRING
+            TRY_CAST
             (
-                plan_force_json.detail,
-                CHARINDEX(''regressedPlanId: '', plan_force_json.detail) + LEN(''regressedPlanId: ''),
-                IIF
+                LTRIM
                 (
-                    CHARINDEX('','', plan_force_json.detail, CHARINDEX(''regressedPlanId: '', plan_force_json.detail) + LEN('','')) = 0,
-                    LEN(plan_force_json.detail),
-                    CHARINDEX('','', plan_force_json.detail, CHARINDEX(''regressedPlanId: '', plan_force_json.detail) + LEN('',''))
-                )
-                - LEN(''regressedPlanId: '') - CHARINDEX(''regressedPlanId: '', plan_force_json.detail)
+                    SUBSTRING
+                    (
+                        plan_force_json.detail,
+                        CHARINDEX(''regressedPlanId: '', plan_force_json.detail) + LEN(''regressedPlanId: ''),
+                        IIF
+                        (
+                            CHARINDEX('','', plan_force_json.detail, CHARINDEX(''regressedPlanId: '', plan_force_json.detail) + LEN('','')) = 0,
+                            LEN(plan_force_json.detail),
+                            CHARINDEX('','', plan_force_json.detail, CHARINDEX(''regressedPlanId: '', plan_force_json.detail) + LEN('',''))
+                        )
+                        - LEN(''regressedPlanId: '') - CHARINDEX(''regressedPlanId: '', plan_force_json.detail)
+                    )
+                ) AS bigint
             ),
         recommended_plan_id =
-            SUBSTRING
+            TRY_CAST
             (
-                plan_force_json.detail,
-                CHARINDEX(''recommendedPlanId: '', plan_force_json.detail) + LEN(''recommendedPlanId: ''),
-                IIF
+                LTRIM
                 (
-                    CHARINDEX('','', plan_force_json.detail, CHARINDEX(''recommendedPlanId: '', plan_force_json.detail) + LEN('','')) = 0,
-                    LEN(plan_force_json.detail),
-                    CHARINDEX('','', plan_force_json.detail, CHARINDEX(''recommendedPlanId: '', plan_force_json.detail) + LEN('',''))
-                )
-                - LEN(''recommendedPlanId: '') - CHARINDEX(''recommendedPlanId: '', plan_force_json.detail)
+                    SUBSTRING
+                    (
+                        plan_force_json.detail,
+                        CHARINDEX(''recommendedPlanId: '', plan_force_json.detail) + LEN(''recommendedPlanId: ''),
+                        IIF
+                        (
+                            CHARINDEX('','', plan_force_json.detail, CHARINDEX(''recommendedPlanId: '', plan_force_json.detail) + LEN('','')) = 0,
+                            LEN(plan_force_json.detail),
+                            CHARINDEX('','', plan_force_json.detail, CHARINDEX(''recommendedPlanId: '', plan_force_json.detail) + LEN('',''))
+                        )
+                        - LEN(''recommendedPlanId: '') - CHARINDEX(''recommendedPlanId: '', plan_force_json.detail)
+                    )
+                ) AS bigint
             )
     FROM
     (
